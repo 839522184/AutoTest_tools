@@ -1,47 +1,28 @@
 import re
 import subprocess
 import time
+import tkinter as tk
+from tkinter import ttk
 
+# 创建主窗口
+root = tk.Tk()
+root.title("UI 元素树")
+root.geometry("1000x650")
 
-def find_path_to_key(nested_dict, target_key):
-    def traverse(d, path):
-        if isinstance(d, dict):
-            for key, value in d.items():
-                new_path = path + [key]
-                if key == target_key:
-                    return new_path
-                result = traverse(value, new_path)
-                if result:
-                    return result
-        elif isinstance(d, list):
-            for index, item in enumerate(d):
-                new_path = path + [index]
-                result = traverse(item, new_path)
-                if result:
-                    return result
-        return None
+# 创建左右主分栏
+main_paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+main_paned.pack(fill="both", expand=True, padx=10, pady=10)
 
-    return traverse(nested_dict, [])
+# --- 左侧：元素层级树 ---
+left_frame = ttk.Frame(main_paned)
+main_paned.add(left_frame, weight=1)
 
+tree = ttk.Treeview(left_frame)
+tree.heading("#0", text="UI 元素层级树", anchor="w")
+tree.pack(fill="both", expand=True)
 
-# 示例多层嵌套字典
-nested_dict = {
-    "outer": {
-        "middle": {
-            "inner": {
-                "unique_key": "unique_value"
-            }
-        },
-        "list_part": [
-            {"not_the_key": "not_the_value"},
-            {"also_not": "also_not_value"}
-        ]
-    }
-}
+scrollbar = ttk.Scrollbar(tree, orient="vertical", command=tree.yview)
+tree.configure(yscrollcommand=scrollbar.set)
+scrollbar.pack(side="right", fill="y")
 
-target_key = "unique_key"
-start_time = time.time()
-path = find_path_to_key(nested_dict, target_key)
-end_time = time.time()
-print(end_time - start_time)
-print(path)
+root.mainloop()
