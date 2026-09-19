@@ -1,7 +1,15 @@
 import os
+import sys
 import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+
+# 把项目根目录（element_tree/ 的父目录）加入 sys.path，
+# 保证无论从哪个工作目录启动（python tree.py / python -m element_tree.tree / 双击），
+# 都能以包方式 import element_tree 下的子模块。
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from element_tree.get_uuid import generate_unique_id
 

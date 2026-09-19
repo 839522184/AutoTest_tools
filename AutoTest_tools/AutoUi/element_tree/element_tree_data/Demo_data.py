@@ -37,7 +37,7 @@ data = {
                 },
                 '5848adee814f46a4b8c389d8c796f411': {
                     'name': '设备名称',
-                    'location_flag': 'image',
+                    'location_flag': 'location',
                     'do_action': '',
                     'location': {
                         'resourceId': 'android:id/title',
@@ -82,7 +82,7 @@ data = {
                     },
                     'xpath': '//*[]',
                     'image': {
-                        'image_path': 'sssss',
+                        'image_path': '时间',
                         'compare': 0.85
                     },
                     'container': {
