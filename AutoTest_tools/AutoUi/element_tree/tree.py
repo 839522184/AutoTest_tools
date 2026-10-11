@@ -1,8 +1,22 @@
 import os
 import sys
+import site
+import tempfile
+import time
 import datetime
+import threading
+import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
+
+# 本机 Python3.8 的 ENABLE_USER_SITE=False（user site 默认不加载），
+# 手动把 user site 目录加入搜索路径，以加载 pip --user 安装的 Pillow 等包。
+try:
+    site.addsitedir(site.USER_SITE)
+except Exception:
+    pass
+
+from PIL import Image, ImageTk
 
 # 把项目根目录（element_tree/ 的父目录）加入 sys.path，
 # 保证无论从哪个工作目录启动（python tree.py / python -m element_tree.tree / 双击），
@@ -22,12 +36,35 @@ def _log(msg):
     ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
     print(f"[{ts}] {msg}", flush=True)
 
+
+# 是否有未保存的修改：置位时保存按钮高亮
+_dirty = False
+
+
+def _set_dirty(dirty):
+    """切换「未保存」状态，并同步保存按钮的高亮样式。"""
+    global _dirty
+    if dirty == _dirty:
+        return
+    _dirty = dirty
+    if dirty:
+        btn_save.config(style="SaveDirty.TButton", text="💾 保存*")
+    else:
+        btn_save.config(style="TButton", text="💾 保存")
+
+
 # ------------------------ ** 变量在此处存放 **
 # 元素树数据所在包与目录
 DATA_PACKAGE = "element_tree.element_tree_data"
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "element_tree_data")
 SAVE_HEADER = "# 本文件由 tree.py 自动生成/覆盖保存\n"
 DEFAULT_MODULE = "Demo_data"   # 默认加载的元素树模块名
+
+# 图片相关
+IMAGE_DIR = os.path.join(_PROJECT_ROOT, "element_tree", "Images")  # 裁剪图片保存目录
+IMAGE_PREVIEW_WIDTH = 300      # 缩略图最大宽度（px）
+IMAGE_REL_PREFIX = "element_tree/Images"   # 落盘时写入 image_path 的相对路径前缀
+ADB_EXEC = "adb"               # adb 可执行文件（已在 PATH 或填完整路径）
 # ------------------------ ** **
 
 # 运行时状态：当前加载的元素树字典、模块对象、字典变量名
@@ -156,6 +193,7 @@ def load_data_module(mod_name):
     info_text.set("请在左侧选择一个节点")
     table_title.set("📋 组件属性表")
     status_var.set(f"📂 已加载元素树: {mod_name}")
+    _set_dirty(False)  # 切换元素树后未保存状态清零
     return True
 
 
@@ -197,7 +235,7 @@ def update_right_display(from_tree_click=False):
         for idx, (attr, value) in enumerate(flatten_props(val, current_mode)):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
             prop_table.insert("", "end", values=(attr, value), tags=(tag,))
-        table_title.set(f"📋 组件属性表 — 当前定位方式: {current_mode}（双击值可编辑）")
+        table_title.set(f"📋 组件属性表 — 按 location_flag={current_mode} 展示（双击值可编辑）")
     else:
         prop_table.insert("", "end", values=("（分类节点）", "无定位与容器属性"), tags=("evenrow",))
         table_title.set("📋 组件属性表")
@@ -209,9 +247,12 @@ def update_right_display(from_tree_click=False):
     else:
         code_box.insert(tk.END, "# 该节点没有关联的 Python 代码")
 
+    # 5. 刷新右上图片预览区（image 定位方式下展示缩略图 / 框选）
+    _refresh_image_preview(is_dict, current_mode)
+
 
 def commit_edit(attr, new_text):
-    """把表格里编辑后的值写回底层 data 字典，并自动落盘。
+    """把表格里编辑后的值写回底层 data 字典（仅改内存，保存需点「保存」按钮）。
     允许编辑：location / xpath / image / container 字段。"""
     sel = element_tree.selection()
     if not sel:
@@ -240,14 +281,11 @@ def commit_edit(attr, new_text):
     else:
         return
 
-    _log(f"修改组件 [{key}] 属性 {attr}: {old_val!r} -> {new_text!r}")
+    _log(f"修改组件 [{key}] 属性 {attr}: {old_val!r} -> {new_text!r}（未保存）")
 
     update_right_display(from_tree_click=False)
-    ok, msg = persist_data()
-    if ok:
-        status_var.set(f"✏️ 已更新 {attr} 并保存")
-    else:
-        status_var.set(f"⚠️ {attr} 已更新但保存失败: {msg}")
+    status_var.set(f"✏️ 已更新 {attr}（未保存，点击「保存」落盘）")
+    _set_dirty(True)
 
 
 def on_prop_double_click(event):
@@ -340,11 +378,8 @@ def add_component():
     element_tree.item(parent_iid, open=True)
     element_tree.selection_set(child_iid)
     update_right_display(from_tree_click=True)
-    ok, msg = persist_data()
-    if ok:
-        status_var.set(f"➕ 已添加组件: {name} 并保存")
-    else:
-        status_var.set(f"⚠️ 已添加 {name} 但保存失败: {msg}")
+    status_var.set(f"➕ 已添加组件: {name}（未保存，点击「保存」落盘）")
+    _set_dirty(True)
 
 
 def delete_component():
@@ -370,12 +405,166 @@ def delete_component():
 
     element_tree.delete(iid)
     node_data_map.pop(iid, None)
-    _log(f"删除组件: ID={key}, 名称={name!r}")
-    ok, msg = persist_data()
-    if ok:
-        status_var.set(f"🗑️ 已删除组件: {name} 并保存")
-    else:
-        status_var.set(f"⚠️ 已删除 {name} 但保存失败: {msg}")
+    _log(f"删除组件: ID={key}, 名称={name!r}（未保存）")
+    status_var.set(f"🗑️ 已删除组件: {name}（未保存，点击「保存」落盘）")
+    _set_dirty(True)
+
+
+def add_component_ocr():
+    """右键「新增-OCR」：Android 截图 → 弹窗框选 → RapidOCR 识别 → 以识别内容新建组件。"""
+    sel = element_tree.selection()
+    if not sel:
+        messagebox.showinfo("提示", "请先在左侧选中一个父节点", parent=root)
+        return
+    parent_iid = sel[0]
+    pkey, pval = node_data_map[parent_iid]
+    if not isinstance(pval, dict):
+        messagebox.showwarning("无法添加", "该节点不是容器，无法添加子组件", parent=root)
+        return
+
+    # 1. Android 截图
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"adb_shot_ocr_{datetime.datetime.now().strftime('%H%M%S%f')}.png")
+    ok, msg = take_android_screenshot(tmp)
+    if not ok:
+        messagebox.showerror("截图失败", msg, parent=root)
+        return
+    try:
+        img = Image.open(tmp).convert("RGB")
+    except Exception as e:
+        messagebox.showerror("截图读取失败", str(e), parent=root)
+        return
+
+    # 2. 弹窗展示截图，供框选 + OCR
+    win = tk.Toplevel(root)
+    win.title("新增组件 - OCR 框选识别")
+    win.configure(bg=BG_PANEL)
+    win.transient(root)
+    win.grab_set()
+
+    max_w, max_h = 900, 540
+    scale = min(max_w / img.width, max_h / img.height, 1.0)
+    disp_w, disp_h = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+    photo = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
+    win._photo = photo
+
+    canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg=BG_WIDGET,
+                       highlightthickness=0, cursor="crosshair")
+    canvas.pack(padx=8, pady=(8, 0))
+    canvas.create_image(0, 0, anchor="nw", image=photo)
+
+    state = {"start": None, "rect": None, "name": ""}
+    result_var = tk.StringVar(value="拖动鼠标框选目标区域后点击 OCR")
+
+    def reset_ocr_state():
+        btn_ocr.config(text="📖 OCR", state="normal", command=do_ocr)
+        result_var.set("拖动鼠标框选目标区域后点击 OCR")
+
+    def on_press(e):
+        state["start"] = (e.x, e.y)
+        if state["rect"]:
+            canvas.delete(state["rect"])
+            state["rect"] = None
+        state["name"] = ""
+        reset_ocr_state()
+
+    def on_drag(e):
+        if state["start"] is None:
+            return
+        if state["rect"]:
+            canvas.delete(state["rect"])
+        x0, y0 = state["start"]
+        state["rect"] = canvas.create_rectangle(x0, y0, e.x, e.y,
+                                                outline=ACCENT, width=2)
+
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+
+    # 3. 底部按钮区：识别结果(左) + 取消 / OCR(确定)（右）
+    bar = ttk.Frame(win)
+    bar.pack(fill="x", pady=8)
+    result_lbl = ttk.Label(bar, textvariable=result_var, foreground=ACCENT)
+    result_lbl.pack(side="left", padx=12)
+
+    def do_ocr():
+        if not state["rect"]:
+            messagebox.showwarning("未框选", "请先拖动鼠标框选目标区域", parent=win)
+            return
+        x0, y0, x2, y2 = canvas.coords(state["rect"])
+        left, top = int(min(x0, x2) / scale), int(min(y0, y2) / scale)
+        right, bot = int(max(x0, x2) / scale), int(max(y0, y2) / scale)
+        if right - left < 2 or bot - top < 2:
+            messagebox.showwarning("区域过小", "框选区域过小，请重新框选", parent=win)
+            return
+        crop = img.crop((left, top, right, bot))
+        btn_ocr.config(text="⏳ 识别中...", state="disabled")
+        result_var.set("正在用 RapidOCR 识别...")
+
+        def work():
+            info = ocr(crop)
+            root.after(0, lambda: on_ocr_done(info))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_ocr_done(info):
+        btn_ocr.config(state="normal")
+        texts = info["str_list"]
+        if not texts:
+            result_var.set("未识别到文字，请重新框选后再试")
+            btn_ocr.config(text="📖 OCR", command=do_ocr)
+            return
+        state["name"] = texts[0]
+        result_var.set(f"识别结果: {texts[0]}（点击确定新建组件）")
+        btn_ocr.config(text="✅ 确定", command=do_confirm)
+
+    def do_confirm():
+        name = state.get("name", "").strip()
+        if not name:
+            messagebox.showwarning("无识别结果", "请先框选并点击 OCR 识别出组件名", parent=win)
+            return
+        try:
+            # 1) 用当前框选区域裁剪图片，保存到 Images 目录
+            if state["rect"]:
+                x0, y0, x2, y2 = canvas.coords(state["rect"])
+                left, top = int(min(x0, x2) / scale), int(min(y0, y2) / scale)
+                right, bot = int(max(x0, x2) / scale), int(max(y0, y2) / scale)
+            else:
+                left, top, right, bot = 0, 0, img.width, img.height
+            os.makedirs(IMAGE_DIR, exist_ok=True)
+            fname = f"{_safe_filename(name)}_{datetime.datetime.now().strftime('%H%M%S')}.png"
+            img.crop((left, top, right, bot)).save(os.path.join(IMAGE_DIR, fname), "PNG")
+            rel_path = f"{IMAGE_REL_PREFIX}/{fname}"
+
+            # 2) 组装新组件：识别结果同时作为 name / location.text / xpath
+            xpath_attr = f'//*[@text="{name.replace(chr(34), chr(39))}"]'
+            new_id = generate_unique_id()
+            new_node = {
+                "name": name,
+                "do_action": "",
+                "location_flag": "location",
+                "location": {"resourceId": "", "text": name, "description": ""},
+                "xpath": xpath_attr,
+                "image": {"image_path": rel_path, "compare": 0.85},
+                "container": {"xpath": "//*[]"},
+            }
+            pval[new_id] = new_node
+            child_iid = element_tree.insert(parent_iid, "end", text=f"{name} ({new_id})")
+            node_data_map[child_iid] = (new_id, new_node)
+            element_tree.item(parent_iid, open=True)
+            element_tree.selection_set(child_iid)
+            update_right_display(from_tree_click=True)
+            status_var.set(f"➕ OCR 新增组件: {name}（未保存，点击「保存」落盘）")
+            _log(f"OCR 新增组件: 父节点={pkey}, 新组件 ID={new_id}, 名称={name!r}, "
+                 f"image={rel_path}, xpath={xpath_attr}（未保存）")
+            _set_dirty(True)
+        finally:
+            win.grab_release()
+            win.destroy()
+
+    btn_cancel = ttk.Button(bar, text="取消", command=win.destroy)
+    btn_cancel.pack(side="right", padx=(4, 12))
+    btn_ocr = ttk.Button(bar, text="📖 OCR", command=do_ocr)
+    btn_ocr.pack(side="right")
 
 
 def show_tree_menu(event):
@@ -384,6 +573,262 @@ def show_tree_menu(event):
         element_tree.selection_set(iid)
         element_tree.focus(iid)
     tree_menu.tk_popup(event.x_root, event.y_root)
+
+
+# ============ 图片预览 / Android 截图 / 框选 ============
+
+# 持有当前缩略图引用，防止被 GC 回收
+_preview_photo = None
+
+
+def _resolve_image_path(path):
+    """把 image_path（相对项目根或绝对路径）解析成绝对路径；不存在则返回 None。"""
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path if os.path.exists(path) else None
+    abs_p = os.path.join(_PROJECT_ROOT, path)
+    return abs_p if os.path.exists(abs_p) else None
+
+
+def take_android_screenshot(dest_path):
+    """用 adb 从 Android 设备截屏保存到 dest_path。返回 (ok, msg)。"""
+    try:
+        result = subprocess.run([ADB_EXEC, "exec-out", "screencap", "-p"],
+                                capture_output=True, timeout=20)
+    except FileNotFoundError:
+        return False, f"未找到 adb（{ADB_EXEC}），请确认已安装并加入 PATH"
+    except Exception as e:
+        return False, f"adb 调用失败: {e}"
+    if result.returncode != 0:
+        return False, result.stderr.decode("utf-8", "ignore").strip() or "adb 截图失败（请确认已连接设备）"
+    if not result.stdout:
+        return False, "adb 返回空数据，截图失败"
+    with open(dest_path, "wb") as f:
+        f.write(result.stdout)
+    return True, dest_path
+
+# RapidOCR 引擎（懒加载 + 线程锁，避免重复初始化模型）
+_ocr_engine = None
+_ocr_lock = threading.Lock()
+
+
+def ocr(img, use_cls=True, use_rec=True):
+    """使用 RapidOCR 识别图片，返回识别信息字典。
+
+    参数:
+        img: PIL Image / numpy.ndarray（BGR）/ 文件路径 / bytes，均可识别
+        use_cls: 是否启用方向分类（默认开启，提高竖排/旋转文字识别率）
+        use_rec: 是否启用文本识别（默认开启）
+
+    返回:
+        {"str_list": [...每行文本...], "strings": "拼接全部文本", "lines": 行数}
+        识别失败或无可识别文字时返回全空结构。
+    """
+    import numpy as np
+    global _ocr_engine
+    try:
+        # 懒加载引擎：首次调用时初始化，之后复用（RapidOCR 模型加载耗时约几秒）
+        if _ocr_engine is None:
+            with _ocr_lock:
+                if _ocr_engine is None:
+                    from rapidocr_onnxruntime import RapidOCR
+                    _ocr_engine = RapidOCR()
+
+        # 统一转成 RapidOCR 接受的输入：PIL/RGB ndarray -> BGR ndarray
+        if hasattr(img, "convert"):                      # PIL Image
+            arr = np.array(img.convert("RGB"))[:, :, ::-1].copy()
+        elif hasattr(img, "shape"):                       # 已是 ndarray
+            arr = img
+        else:                                             # 路径 / bytes
+            arr = img
+
+        start = time.time()
+        result, _ = _ocr_engine(arr, use_cls=use_cls, use_rec=use_rec)
+        _log(f"OCR 识别完成，耗时 {time.time() - start:.3f}s")
+    except Exception as e:
+        _log(f"OCR 识别失败: {e}")
+        return {"str_list": [], "strings": "", "lines": 0}
+
+    str_list = []
+    strings = ""
+    if result:
+        for res in result:
+            if len(res) >= 2 and res[1]:
+                text = str(res[1]).strip()
+                str_list.append(text)
+                strings += text
+    return {"str_list": str_list, "strings": strings, "lines": len(str_list)}
+
+def show_full_image(abs_path):
+    """弹窗展示原图（可滚动查看）。"""
+    win = tk.Toplevel(root)
+    win.title("原图预览")
+    win.configure(bg=BG_PANEL)
+    try:
+        img = Image.open(abs_path).convert("RGB")
+    except Exception as e:
+        messagebox.showerror("预览失败", f"无法打开图片: {e}", parent=root)
+        win.destroy()
+        return
+    photo = ImageTk.PhotoImage(img)
+    win._photo = photo  # 持有引用防 GC
+    canvas = tk.Canvas(win, bg=BG_WIDGET, highlightthickness=0)
+    hs = ttk.Scrollbar(win, orient="horizontal", command=canvas.xview)
+    vs = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+    canvas.configure(xscrollcommand=hs.set, yscrollcommand=vs.set)
+    canvas.create_image(0, 0, anchor="nw", image=photo)
+    canvas.config(scrollregion=(0, 0, img.width, img.height))
+    canvas.grid(row=0, column=0, sticky="nsew")
+    vs.grid(row=0, column=1, sticky="ns")
+    hs.grid(row=1, column=0, sticky="ew")
+    win.rowconfigure(0, weight=1)
+    win.columnconfigure(0, weight=1)
+    win.geometry("900x650")
+
+
+def _safe_filename(name):
+    """把名称清洗成可用作文件名的字符串。"""
+    cleaned = "".join(c for c in str(name) if c.isalnum() or c in "-_.").strip(" .")
+    return cleaned or "img"
+
+
+def _refresh_image_preview(is_dict, mode):
+    """按当前选中节点刷新「缩略图展示区」：image 定位方式下展示缩略图 + 框选按钮。"""
+    global _preview_photo
+    for w in image_preview_body.winfo_children():
+        w.destroy()
+
+    # 仅 image 定位方式下展示
+    if not (is_dict and mode == "image"):
+        ttk.Label(image_preview_body, text="📷 仅 image 定位方式下展示缩略图",
+                  foreground=FG_DIM).pack(anchor="w")
+        return
+
+    sel = element_tree.selection()
+    if not sel:
+        ttk.Label(image_preview_body, text="请在左侧选择一个组件节点",
+                  foreground=FG_DIM).pack(anchor="w")
+        return
+    key, val = node_data_map.get(sel[0], (None, None))
+    img_path = ""
+    if isinstance(val, dict):
+        img = val.get("image", {})
+        img_path = img.get("image_path", "") if isinstance(img, dict) else ""
+    abs_path = _resolve_image_path(img_path)
+
+    if not abs_path:
+        ttk.Label(image_preview_body, text="⚠️ 未找到图片文件，可用「框选」从 Android 截图生成",
+                  foreground=ACCENT).pack(anchor="w")
+        ttk.Button(image_preview_body, text="📌 框选", command=lambda: box_select_image(key, val)).pack(anchor="w", pady=(4, 0))
+        return
+
+    try:
+        img = Image.open(abs_path)
+        img.thumbnail((IMAGE_PREVIEW_WIDTH, 300))
+        _preview_photo = ImageTk.PhotoImage(img)
+    except Exception as e:
+        ttk.Label(image_preview_body, text=f"⚠️ 图片加载失败: {e}", foreground=ACCENT).pack(anchor="w")
+        ttk.Button(image_preview_body, text="📌 框选", command=lambda: box_select_image(key, val)).pack(anchor="w", pady=(4, 0))
+        return
+
+    # image.image_path 信息行 + 框选按钮：放在缩略图上方，避免缩略图过大挡住按钮
+    path_row = ttk.Frame(image_preview_body)
+    path_row.pack(fill="x", pady=(0, 6), anchor="w")
+    ttk.Label(path_row, text=f"image.image_path: {img_path}",
+              foreground=FG_TEXT).pack(side="left")
+    ttk.Button(path_row, text="📌 框选", command=lambda: box_select_image(key, val)).pack(side="left", padx=(10, 0))
+
+    lbl = ttk.Label(image_preview_body, image=_preview_photo, cursor="hand2")
+    lbl.image = _preview_photo
+    lbl.pack(anchor="w")
+    lbl.bind("<Button-1>", lambda e: show_full_image(abs_path))
+    ttk.Label(image_preview_body, text="🖱️ 点击缩略图查看原图",
+              foreground=FG_DIM).pack(anchor="w")
+
+
+def box_select_image(key, val):
+    """Android 截图并弹窗框选，保存裁剪图片到 IMAGE_DIR，回写 image_path。"""
+    tmp = os.path.join(tempfile.gettempdir(), f"adb_shot_{str(key)[:8]}.png")
+    ok, msg = take_android_screenshot(tmp)
+    if not ok:
+        messagebox.showerror("截图失败", msg, parent=root)
+        return
+    try:
+        img = Image.open(tmp).convert("RGB")
+    except Exception as e:
+        messagebox.showerror("截图读取失败", str(e), parent=root)
+        return
+
+    win = tk.Toplevel(root)
+    win.title(f"框选图片区域 — {val.get('name', key) if isinstance(val, dict) else key}")
+    win.configure(bg=BG_PANEL)
+    win.transient(root)
+    win.grab_set()
+
+    # 缩放展示（原图可能很大）
+    max_w, max_h = 900, 540
+    scale = min(max_w / img.width, max_h / img.height, 1.0)
+    disp_w, disp_h = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+    photo = ImageTk.PhotoImage(img.resize((disp_w, disp_h)))
+    win._photo = photo
+
+    canvas = tk.Canvas(win, width=disp_w, height=disp_h, bg=BG_WIDGET,
+                       highlightthickness=0, cursor="crosshair")
+    canvas.pack(padx=8, pady=(8, 0))
+    canvas.create_image(0, 0, anchor="nw", image=photo)
+
+    state = {"start": None, "rect": None}
+
+    def on_press(e):
+        state["start"] = (e.x, e.y)
+        if state["rect"]:
+            canvas.delete(state["rect"])
+            state["rect"] = None
+
+    def on_drag(e):
+        if state["start"] is None:
+            return
+        if state["rect"]:
+            canvas.delete(state["rect"])
+        x0, y0 = state["start"]
+        state["rect"] = canvas.create_rectangle(
+            x0, y0, e.x, e.y, outline=ACCENT, width=2)
+
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+
+    bar = ttk.Frame(win)
+    bar.pack(fill="x", pady=8)
+    ttk.Label(bar, text="拖动鼠标框选目标区域", foreground=FG_DIM).pack(side="left", padx=12)
+    ttk.Button(bar, text="取消", command=win.destroy).pack(side="right", padx=(4, 12))
+
+    def do_save():
+        if not state["rect"]:
+            messagebox.showwarning("未框选", "请先拖动鼠标框选目标区域", parent=win)
+            return
+        x0, y0, x2, y2 = canvas.coords(state["rect"])
+        left, top = int(min(x0, x2) / scale), int(min(y0, y2) / scale)
+        right, bot = int(max(x0, x2) / scale), int(max(y0, y2) / scale)
+        if right - left < 2 or bot - top < 2:
+            messagebox.showwarning("区域过小", "框选区域过小，请重新框选", parent=win)
+            return
+        crop = img.crop((left, top, right, bot))
+        os.makedirs(IMAGE_DIR, exist_ok=True)
+        name_src = val.get("name") if isinstance(val, dict) else key
+        fname = f"{_safe_filename(name_src)}_{datetime.datetime.now().strftime('%H%M%S')}.png"
+        save_path = os.path.join(IMAGE_DIR, fname)
+        crop.save(save_path, "PNG")
+        rel_path = f"{IMAGE_REL_PREFIX}/{fname}"
+        if isinstance(val, dict):
+            val.setdefault("image", {})["image_path"] = rel_path
+        status_var.set(f"🖼️ 已保存裁剪图片: {rel_path}（未保存，点击「保存」落盘）")
+        _log(f"框选保存图片: {key} -> {rel_path}（未保存）")
+        update_right_display(from_tree_click=False)
+        _set_dirty(True)
+        win.destroy()
+
+    ttk.Button(bar, text="💾 保存", command=do_save).pack(side="right")
 
 
 # ============ 保存到文件 ============
@@ -422,6 +867,7 @@ def save_to_file():
     ok, msg = persist_data()
     if ok:
         status_var.set(f"💾 已保存到 {msg}")
+        _set_dirty(False)  # 保存成功，取消高亮
     else:
         messagebox.showerror("保存失败", msg, parent=root)
 
@@ -439,7 +885,7 @@ def on_tree_select(event):
 
 
 def on_mode_change():
-    """手动切换右上定位方式时，把选择写回当前节点的 location_flag 并保存。"""
+    """手动切换右上定位方式时，把选择写回当前节点的 location_flag（仅内存，保存需点「保存」按钮）。"""
     sel = element_tree.selection()
     if sel:
         key, val = node_data_map.get(sel[0], (None, None))
@@ -448,12 +894,9 @@ def on_mode_change():
             old_flag = val.get("location_flag", "location")
             if old_flag != chosen:
                 val["location_flag"] = chosen
-                _log(f"组件 [{val.get('name','?')} ({key})] 定位方式 {old_flag} -> {chosen}")
-                ok, msg = persist_data()
-                if ok:
-                    status_var.set(f"🏷️ 已将定位方式记为 {chosen} 并保存")
-                else:
-                    status_var.set(f"⚠️ 已切换 {chosen} 但保存失败: {msg}")
+                _log(f"组件 [{val.get('name','?')} ({key})] 定位方式 {old_flag} -> {chosen}（未保存）")
+                status_var.set(f"🏷️ 已将定位方式记为 {chosen}（未保存，点击「保存」落盘）")
+                _set_dirty(True)
     update_right_display(from_tree_click=False)
 
 
@@ -505,6 +948,14 @@ style.map("TCombobox",
           fieldbackground=[("readonly", BG_INPUT)],
           foreground=[("readonly", FG_TEXT)])
 style.configure("TEntry", fieldbackground=BG_INPUT, foreground=FG_TEXT, insertcolor="#BBB5AF")
+
+# 保存按钮「有未保存修改」时的高亮样式（醒目橙色）
+style.configure("SaveDirty.TButton", background=ACCENT, foreground="#1e1e1e",
+                borderwidth=0, font=("Microsoft YaHei UI", 9, "bold"),
+                padding=(8, 4))
+style.map("SaveDirty.TButton",
+          background=[("active", "#e09a5a"), ("pressed", "#b9671f")],
+          foreground=[("disabled", "#1e1e1e")])
 
 # 左侧树 / 右侧表格
 style.configure("Treeview",
@@ -567,6 +1018,7 @@ element_tree.pack(side="left", fill="both", expand=True)
 tree_menu = tk.Menu(root, tearoff=0)
 tree_menu.add_command(label="复制组件 ID", command=copy_component_id)
 tree_menu.add_command(label="添加组件", command=add_component)
+tree_menu.add_command(label="添加组件-OCR", command=add_component_ocr)
 tree_menu.add_separator()
 tree_menu.add_command(label="删除组件", command=delete_component)
 element_tree.bind("<Button-3>", show_tree_menu)
@@ -615,9 +1067,9 @@ r_image.pack(side="left", padx=3)
 right_paned = ttk.Panedwindow(right_frame, orient=tk.VERTICAL)
 right_paned.pack(fill="both", expand=True)
 
-# 3.1 上方：Excel 风格属性表
+# 3.1 属性展示区（weight=2）
 top_info_frame = ttk.Frame(right_paned)
-right_paned.add(top_info_frame, weight=3)
+right_paned.add(top_info_frame, weight=2)
 
 table_title = tk.StringVar(value="📋 组件属性表 (Excel 风格)")
 lbl_attr = ttk.Label(top_info_frame, textvariable=table_title,
@@ -648,9 +1100,18 @@ prop_table.pack(side="left", fill="both", expand=True)
 # 双击编辑
 prop_table.bind("<Double-1>", on_prop_double_click)
 
-# 3.2 下方：Python 代码块
+# 3.2 缩略图展示区（weight=3）
+image_preview_frame = ttk.Frame(right_paned)
+right_paned.add(image_preview_frame, weight=3)
+ttk.Label(image_preview_frame, text="🖼️ 图片预览区（点击缩略图查看原图）",
+          font=("Microsoft YaHei UI", 9, "bold"),
+          foreground=ACCENT).pack(anchor="w", pady=(6, 2))
+image_preview_body = ttk.Frame(image_preview_frame)
+image_preview_body.pack(fill="both", expand=True)
+
+# 3.3 do_action 展示区（weight=1）
 bottom_code_frame = ttk.Frame(right_paned)
-right_paned.add(bottom_code_frame, weight=2)
+right_paned.add(bottom_code_frame, weight=1)
 
 lbl_code = ttk.Label(bottom_code_frame, text="🐍 do_action (Python 代码块):",
                      font=("Microsoft YaHei UI", 9, "bold"),
@@ -686,5 +1147,28 @@ if available_modules:
 
 # 事件绑定
 element_tree.bind("<<TreeviewSelect>>", on_tree_select)
+
+
+def _init_pane_ratios():
+    """初始按 1:1:1 分配右侧三栏（属性:缩略图:do_action）。
+
+    ttk.Panedwindow 的 weight 只在窗口拉伸时生效，初始布局按各 pane 内容
+    实际大小分配，导致内容少的缩略图区被压扁。这里在布局完成后手动把两个
+    分隔条设到 1/3 与 2/3 的高度位置，强制三栏按 1:1:1 展示。
+    """
+    try:
+        root.update_idletasks()
+        h = right_paned.winfo_height()
+        if h > 10:
+            right_paned.sashpos(0, int(h * 1 / 3))
+            right_paned.sashpos(1, int(h * 2 / 3))
+    except tk.TclError:
+        pass
+
+
+# 窗口较小/非最大化时布局也较慢，多试几次确保比例生效
+root.after(80, _init_pane_ratios)
+root.after(300, _init_pane_ratios)
+root.after(600, _init_pane_ratios)
 
 root.mainloop()
