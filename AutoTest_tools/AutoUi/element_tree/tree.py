@@ -6,6 +6,7 @@ import time
 import datetime
 import threading
 import subprocess
+import ast
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
@@ -29,6 +30,12 @@ from element_tree.get_uuid import generate_unique_id
 
 # 存储节点 iid -> (key, value) 映射
 node_data_map = {}
+
+# do_action 方法缓存：{方法名: 源码文本}、{方法名: 所在文件路径}
+_do_action_methods = {}
+_do_action_files = {}
+# do_action 编辑框的「已保存」内容快照（用于判断是否有未保存修改）
+_saved_code_snapshot = ""
 
 
 def _log(msg):
@@ -65,6 +72,9 @@ IMAGE_DIR = os.path.join(_PROJECT_ROOT, "element_tree", "Images")  # 裁剪图�
 IMAGE_PREVIEW_WIDTH = 300      # 缩略图最大宽度（px）
 IMAGE_REL_PREFIX = "element_tree/Images"   # 落盘时写入 image_path 的相对路径前缀
 ADB_EXEC = "adb"               # adb 可执行文件（已在 PATH 或填完整路径）
+
+# do_action 方法目录：存放各组件 do_action 方法的源码文件
+DO_ACTION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "do_action")
 # ------------------------ ** **
 
 # 运行时状态：当前加载的元素树字典、模块对象、字典变量名
@@ -164,6 +174,7 @@ def _find_tree_dict(mod):
 def load_data_module(mod_name):
     """动态加载指定元素树模块，重建左侧树并清空右侧面板。"""
     global data, current_mod, current_dict_name
+    _scan_do_action_methods()
     try:
         import importlib
         mod = importlib.import_module(f"{DATA_PACKAGE}.{mod_name}")
@@ -208,6 +219,7 @@ def on_combo_select(event):
 
 def update_right_display(from_tree_click=False):
     """核心联动：刷新右侧 Excel 属性表与下方代码框"""
+    global _saved_code_snapshot
     selected_items = element_tree.selection()
     if not selected_items:
         return
@@ -241,12 +253,25 @@ def update_right_display(from_tree_click=False):
         prop_table.insert("", "end", values=("（分类节点）", "无定位与容器属性"), tags=("evenrow",))
         table_title.set("📋 组件属性表")
 
-    # 4. 下方 do_action 代码块
+    # 4. 下方 do_action 代码块：以组件 ID 作为方法名，仅显示内部方法体（隐藏 def <ID> 外层）
     code_box.delete("1.0", tk.END)
-    if is_dict and val.get("do_action"):
-        code_box.insert(tk.END, val["do_action"])
+    if is_dict:
+        method_key = str(key)
+        # 兼容旧数据：do_action 字段指向已有方法时按旧方法名检索
+        if method_key not in _do_action_methods and val.get("do_action") in _do_action_methods:
+            method_key = val["do_action"]
+        src = _do_action_methods.get(method_key)
+        if src:
+            body = _dedent(_extract_func_body(src))
+            code_box.insert(tk.END, body)
+            if body and not body.endswith("\n"):
+                code_box.insert(tk.END, "\n")
+        else:
+            code_box.insert(tk.END, "该节点没有关联的 Python 代码")
     else:
         code_box.insert(tk.END, "# 该节点没有关联的 Python 代码")
+    # 记录快照：展示视为已保存状态，用户后续改动才触发未保存高亮
+    _saved_code_snapshot = code_box.get("1.0", tk.END)
 
     # 5. 刷新右上图片预览区（image 定位方式下展示缩略图 / 框选）
     _refresh_image_preview(is_dict, current_mode)
@@ -1092,6 +1117,229 @@ def box_select_image(key, val):
     ttk.Button(bar, text="💾 保存", command=do_save).pack(side="right")
 
 
+# ============ do_action 方法检索 / 编辑保存 ============
+
+def _scan_do_action_methods():
+    """扫描 DO_ACTION_DIR 下所有 .py，建立 {方法名: 源码} 与 {方法名: 文件路径} 映射。"""
+    global _do_action_methods, _do_action_files
+    _do_action_methods = {}
+    _do_action_files = {}
+    if not os.path.isdir(DO_ACTION_DIR):
+        return
+    for fname in os.listdir(DO_ACTION_DIR):
+        if not fname.endswith(".py"):
+            continue
+        fpath = os.path.join(DO_ACTION_DIR, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                src = f.read()
+            tree = ast.parse(src)
+            lines = src.splitlines()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    code = "\n".join(lines[node.lineno - 1:node.end_lineno])
+                    _do_action_methods[node.name] = code
+                    _do_action_files[node.name] = fpath
+        except Exception:
+            continue
+    if _do_action_methods:
+        _log(f"do_action 方法扫描: 共 {len(_do_action_methods)} 个"
+             f" -> {', '.join(list(_do_action_methods)[:10])}")
+
+
+def _extract_func_body(src):
+    """从 def 块源码中提取函数体（去掉 def 定义行）。"""
+    lines = src.splitlines()
+    if not lines:
+        return ""
+    return "\n".join(lines[1:])
+
+
+def _dedent(text):
+    """去掉文本的公共缩进。"""
+    lines = text.splitlines()
+    if not lines:
+        return text
+    indents = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    if not indents:
+        return text
+    n = min(indents)
+    return "\n".join(l[n:] if l.strip() else "" for l in lines)
+
+
+def _wrap_func(name, body):
+    """把编辑框中的内部方法体包装成 def <name>(**kwargs): 方法定义（4 空格缩进）。"""
+    body = body.strip("\n")
+    if not body.strip():
+        return f"def {name}(**kwargs):\n    pass"
+    lines = body.splitlines()
+    indented = "\n".join(("    " + l) if l.strip() else "" for l in lines)
+    return f"def {name}(**kwargs):\n{indented}"
+
+
+def _get_default_action_file():
+    """获取保存 do_action 的目标文件：优先 DO_ACTION_DIR 下已有 .py，否则新建 do_action.py。"""
+    if not os.path.isdir(DO_ACTION_DIR):
+        os.makedirs(DO_ACTION_DIR, exist_ok=True)
+    for fname in sorted(os.listdir(DO_ACTION_DIR)):
+        if fname.endswith(".py"):
+            return os.path.join(DO_ACTION_DIR, fname)
+    return os.path.join(DO_ACTION_DIR, "do_action.py")
+
+
+def _parse_funcs(code):
+    """从代码文本中解析出 {函数名: 源码}；语法错误返回 None。"""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    funcs = {}
+    lines = code.splitlines()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef):
+            funcs[n.name] = "\n".join(lines[n.lineno - 1:n.end_lineno])
+    return funcs
+
+
+def _write_funcs_to_file(fpath, funcs):
+    """把编辑框解析出的方法集合写回方法文件：
+    - 文件已有的方法：原位替换函数区间
+    - 新增的方法：追加到文件末尾（空行分隔）
+    返回本次写入的方法名列表。"""
+    if os.path.exists(fpath):
+        with open(fpath, "r", encoding="utf-8") as f:
+            src = f.read()
+    else:
+        src = ""
+    ftree = ast.parse(src or "")
+    flines = src.splitlines() if src else []
+
+    # 文件中已存在的函数行区间：{name: (start, end)}
+    file_funcs = {}
+    for n in ast.walk(ftree):
+        if isinstance(n, ast.FunctionDef):
+            file_funcs[n.name] = (n.lineno - 1, n.end_lineno)
+
+    # 1) 原位替换已存在的方法（从后往前，避免行号错乱）
+    new_lines = flines
+    repl = [(file_funcs[name][0], file_funcs[name][1], funcs[name].splitlines())
+            for name in funcs if name in file_funcs]
+    for s, e, clines in sorted(repl, reverse=True):
+        new_lines = new_lines[:s] + clines + new_lines[e:]
+
+    # 2) 新增方法直接追加到文件末尾（空行分隔）
+    for name in funcs:
+        if name in file_funcs:
+            continue
+        if new_lines and new_lines[-1].strip() != "":
+            new_lines.append("")
+        new_lines.extend(funcs[name].splitlines())
+
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write("\n".join(new_lines) + "\n")
+    return list(funcs.keys())
+
+
+def _remove_funcs_from_file(fpath, names):
+    """从方法文件中按函数行区间删除指定方法，并清理多余空行。
+    names 为要删除的方法名列表；文件不存在或语法错误时静默跳过。"""
+    if not os.path.exists(fpath):
+        return
+    with open(fpath, "r", encoding="utf-8") as f:
+        src = f.read()
+    try:
+        ftree = ast.parse(src)
+    except SyntaxError:
+        return
+    lines = src.splitlines()
+    spans = [(n.lineno - 1, n.end_lineno) for n in ast.walk(ftree)
+             if isinstance(n, ast.FunctionDef) and n.name in names]
+    if not spans:
+        return
+    new_lines = lines
+    for s, e in sorted(spans, reverse=True):
+        new_lines = new_lines[:s] + new_lines[e:]
+    # 清理函数块周围多余空行：连续空行压缩为至多 2 个
+    cleaned = []
+    blank = 0
+    for line in new_lines:
+        if line.strip() == "":
+            blank += 1
+            if blank <= 2:
+                cleaned.append(line)
+        else:
+            blank = 0
+            cleaned.append(line)
+    while cleaned and cleaned[0].strip() == "":
+        cleaned.pop(0)
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write("\n".join(cleaned) + ("\n" if cleaned else ""))
+
+
+def _save_do_action_code(_ev=None, silent=False):
+    """把右下代码框内容保存为当前组件的 do_action 方法。
+    方法名 = 组件 ID（key）；编辑框内容为内部方法体，保存时包装为
+    def <组件ID>(**kwargs): 后写回方法文件。
+    silent=True 时由右上角「保存」联动调用，出错只记日志不弹窗。"""
+    global _saved_code_snapshot
+    sel = element_tree.selection()
+    if not sel:
+        return (True if silent else "break")
+    key, val = node_data_map.get(sel[0], (None, None))
+    if not isinstance(val, dict):
+        return (True if silent else "break")
+    method_key = str(key)
+
+    content = code_box.get("1.0", tk.END).rstrip("\n")
+
+    # 编辑框被清空 -> 删除当前组件对应的方法，并把 do_action 字段置空
+    if content.strip() == "":
+        # 兼容旧数据：do_action 指向旧方法名时按旧名删除
+        actual_key = method_key
+        if (actual_key not in _do_action_methods and val.get("do_action")
+                and val["do_action"] in _do_action_methods):
+            actual_key = val["do_action"]
+        existed = actual_key in _do_action_methods or bool(val.get("do_action"))
+        if existed:
+            fpath = _do_action_files.get(actual_key) or _get_default_action_file()
+            _remove_funcs_from_file(fpath, [actual_key])
+            val["do_action"] = ""
+            _scan_do_action_methods()
+            _saved_code_snapshot = ""
+            _log(f"do_action 已删除方法 {actual_key}，组件 {val.get('name','')} 的 "
+                 f"do_action 字段置空（未保存）")
+            if not silent:
+                status_var.set(f"🗑️ 已删除 {val.get('name','')} 的 do_action 方法并置空"
+                               f"（未保存，点击「保存」落盘）")
+                _set_dirty(True)
+        return (True if silent else "break")
+
+    code = _wrap_func(method_key, content)
+    funcs = {method_key: code}
+
+    fpath = _do_action_files.get(method_key) or _get_default_action_file()
+    written = _write_funcs_to_file(fpath, funcs)
+    _scan_do_action_methods()
+    _saved_code_snapshot = code_box.get("1.0", tk.END)
+    _log(f"do_action 代码已保存: {', '.join(written)} -> {fpath}")
+    if not silent:
+        status_var.set(f"✅ do_action 代码已保存: {method_key}（组件 {val.get('name', '')}）")
+        _set_dirty(False)
+    return (True if silent else "break")
+
+
+def _insert_code_tab(_ev=None):
+    """编辑 do_action 代码时按 Tab 插入 4 个空格，保证与代码缩进一致。"""
+    code_box.insert(tk.INSERT, "    ")
+    return "break"
+
+
+def _on_code_edit(_ev=None):
+    """do_action 编辑框内容变化时，与已保存快照比对，判定是否高亮保存按钮。"""
+    if code_box.get("1.0", tk.END) != _saved_code_snapshot:
+        _set_dirty(True)
+
+
 # ============ 保存到文件 ============
 
 def _format_py(obj, level=0):
@@ -1125,9 +1373,12 @@ def persist_data():
 
 
 def save_to_file():
+    # 联动保存：先保存当前 do_action 编辑框中的方法（新增方法会追加到文件末尾）
+    do_action_saved = _save_do_action_code(silent=True)
     ok, msg = persist_data()
     if ok:
-        status_var.set(f"💾 已保存到 {msg}")
+        extra = "；do_action 方法已保存" if do_action_saved else ""
+        status_var.set(f"💾 已保存到 {msg}{extra}")
         _set_dirty(False)  # 保存成功，取消高亮
     else:
         messagebox.showerror("保存失败", msg, parent=root)
@@ -1388,8 +1639,13 @@ code_box = tk.Text(bottom_code_frame,
                    relief="solid", borderwidth=1,
                    insertbackground="#BBB5AF",
                    selectbackground=SEL_BG, selectforeground="#ffffff",
-                   wrap="word")
+                   wrap="word",
+                   tabs=("4c",))   # Tab 显示宽度 = 4 字符，与 4 空格缩进一致
 code_box.pack(fill="both", expand=True)
+# Ctrl+S 保存当前节点的 do_action 代码块；Tab 插入 4 空格缩进；编辑联动保存按钮高亮
+code_box.bind("<Control-s>", _save_do_action_code)
+code_box.bind("<Tab>", _insert_code_tab)
+code_box.bind("<KeyRelease>", _on_code_edit)
 
 # 底部状态栏
 status_var = tk.StringVar(value="就绪")
