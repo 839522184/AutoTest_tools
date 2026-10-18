@@ -88,6 +88,7 @@ def insert_node(tree_widget, parent, key, value):
             if k in ["name", "do_action", "location_flag", "location", "xpath", "image", "container"]:
                 continue
             insert_node(tree_widget, current_node, k, v)
+    return current_node
 
 
 def expand_all(tree_widget, item=""):
@@ -575,6 +576,201 @@ def show_tree_menu(event):
     tree_menu.tk_popup(event.x_root, event.y_root)
 
 
+# ============ 左侧树拖拽改层级 ============
+
+# 拖拽状态
+_drag = {"item": None, "x": 0, "y": 0, "moving": False}
+_drag_ghost = None   # 拖拽时的悬浮跟随窗口
+
+
+def _is_ancestor(anc, node):
+    """判断 anc 是否为 node 的祖先节点（含自身）。"""
+    p = node
+    while p:
+        if p == anc:
+            return True
+        p = element_tree.parent(p)
+    return False
+
+
+def _rebuild_tree():
+    """按当前 data 重建左侧树（不重置未保存状态）。"""
+    element_tree.delete(*element_tree.get_children())
+    node_data_map.clear()
+    for k, v in data.items():
+        insert_node(element_tree, "", k, v)
+    expand_all(element_tree)
+
+
+def _find_iid_by_key(key, parent=""):
+    """在树中按存储 key 递归查找节点 iid，找不到返回 None。"""
+    for child in element_tree.get_children(parent):
+        ckey, _ = node_data_map.get(child, (None, None))
+        if ckey == key:
+            return child
+        found = _find_iid_by_key(key, child)
+        if found:
+            return found
+    return None
+
+
+def _move_node(src_iid, target_iid):
+    """把 src_iid 节点移动到 target_iid（作为其子节点）；target_iid 为空则移到顶层。"""
+    if src_iid == target_iid:
+        return
+    if target_iid and _is_ancestor(src_iid, target_iid):
+        messagebox.showwarning("无法移动", "不能把节点移动到其自身或其子节点下", parent=root)
+        return
+
+    skey, sval = node_data_map.get(src_iid, (None, None))
+    if skey is None:
+        return
+
+    # 先校验目标是否为可作父的容器（dict）
+    if target_iid:
+        tkey, tval = node_data_map.get(target_iid, (None, None))
+        if not isinstance(tval, dict):
+            messagebox.showwarning("无法移动", "目标节点不是容器，无法作为父节点", parent=root)
+            return
+
+    # 从源父字典中摘除
+    src_parent = element_tree.parent(src_iid)
+    if src_parent:
+        _, spval = node_data_map.get(src_parent, (None, None))
+        if isinstance(spval, dict) and skey in spval:
+            del spval[skey]
+        else:
+            return
+    else:
+        if skey in data:
+            del data[skey]
+        else:
+            return
+
+    # 挂到目标下
+    if target_iid:
+        tkey, tval = node_data_map.get(target_iid, (None, None))
+        tval[skey] = sval
+        _log(f"拖拽移动: {skey}（{sval.get('name', skey)}）-> 挂到 {tkey}（{tval.get('name', tkey)}）下（未保存）")
+    else:
+        data[skey] = sval
+        _log(f"拖拽移动: {skey}（{sval.get('name', skey)}）-> 顶层（未保存）")
+
+    # 重建树并选中移动后的节点
+    _rebuild_tree()
+    new_iid = _find_iid_by_key(skey)
+    if new_iid:
+        element_tree.selection_set(new_iid)
+        element_tree.focus(new_iid)
+        parent_iid = element_tree.parent(new_iid)
+        if parent_iid:
+            element_tree.item(parent_iid, open=True)
+    update_right_display(from_tree_click=True)
+    status_var.set("↕️ 已移动组件层级（未保存，点击「保存」落盘）")
+    _set_dirty(True)
+
+
+def _iter_all_items(root_item=""):
+    """递归收集树上全部节点 iid。"""
+    items = list(element_tree.get_children(root_item))
+    for it in items:
+        items.extend(_iter_all_items(it))
+    return items
+
+
+def _clear_drop_tags():
+    """清除所有行上的落点高亮 tag。"""
+    for it in _iter_all_items():
+        tags = list(element_tree.item(it, "tags") or ())
+        if "drop" in tags or "drop_bad" in tags:
+            element_tree.item(it, tags=[t for t in tags if t not in ("drop", "drop_bad")])
+
+
+def _is_drop_valid(target_iid, src_iid):
+    """判断 target 能否作为 src 的新父。返回 (是否可放, 落点描述)。"""
+    if not target_iid:
+        return True, "顶层"
+    if target_iid == src_iid:
+        return False, "不能拖到自身"
+    if _is_ancestor(src_iid, target_iid):
+        return False, "不能拖到自己的子节点"
+    tkey, tval = node_data_map.get(target_iid, (None, None))
+    if not isinstance(tval, dict):
+        return False, "目标不是容器"
+    return True, f"{tval.get('name', tkey)} 下"
+
+
+def _update_ghost(event, src_text):
+    """创建或移动悬浮跟随窗口（无边框置顶，显示被拖节点文本）。"""
+    global _drag_ghost
+    if _drag_ghost is None:
+        _drag_ghost = tk.Toplevel(root)
+        _drag_ghost.overrideredirect(True)
+        _drag_ghost.attributes("-topmost", True)
+        lbl = tk.Label(_drag_ghost, bg="#2b2b2b", fg="#ffffff",
+                       relief="solid", borderwidth=1, padx=6, pady=2,
+                       font=("Microsoft YaHei UI", 9))
+        lbl.pack()
+        _drag_ghost._lbl = lbl
+    _drag_ghost.geometry(f"+{event.x_root + 16}+{event.y_root + 12}")
+
+
+def _update_drop_preview(event):
+    """位置预知：根据鼠标所在行判定落点，高亮目标并更新悬浮窗文字。"""
+    if _drag_ghost is None:
+        return
+    target = element_tree.identify_row(event.y)
+    ok, reason = _is_drop_valid(target, _drag["item"])
+    _clear_drop_tags()
+    if ok and target:
+        element_tree.item(target, tags=("drop",))
+    elif target:
+        element_tree.item(target, tags=("drop_bad",))
+
+    src_text = element_tree.item(_drag["item"], "text")
+    if ok:
+        _drag_ghost._lbl.config(text=f"⇣ {src_text} 将移动到: {reason}")
+    else:
+        _drag_ghost._lbl.config(text=f"✖ {reason}（{src_text}）")
+
+
+def _on_tree_press(event):
+    _drag["item"] = element_tree.identify_row(event.y)
+    _drag["x"] = event.x
+    _drag["y"] = event.y
+    _drag["moving"] = False
+
+
+def _on_tree_drag(event):
+    if not _drag["item"]:
+        return
+    dx = abs(event.x - _drag["x"])
+    dy = abs(event.y - _drag["y"])
+    if not _drag["moving"] and (dx > 8 or dy > 8):
+        _drag["moving"] = True
+    if _drag["moving"]:
+        src_text = element_tree.item(_drag["item"], "text")
+        _update_ghost(event, src_text)
+        _update_drop_preview(event)
+
+
+def _on_tree_release(event):
+    global _drag_ghost
+    src = _drag["item"]
+    was_moving = _drag["moving"]
+    _drag["item"] = None
+    _drag["moving"] = False
+    element_tree.configure(cursor="")
+    _clear_drop_tags()
+    if _drag_ghost is not None:
+        _drag_ghost.destroy()
+        _drag_ghost = None
+    if not src or not was_moving:
+        return
+    target = element_tree.identify_row(event.y)
+    _move_node(src, target)
+
+
 # ============ 图片预览 / Android 截图 / 框选 ============
 
 # 持有当前缩略图引用，防止被 GC 回收
@@ -1008,6 +1204,9 @@ tree_combo.pack(side="left")
 
 element_tree = ttk.Treeview(element_tree_outer, show="tree")
 element_tree.column("#0", anchor="w", width=220, stretch=True)
+# 拖拽落点高亮：合法=橙色，非法=暗红
+element_tree.tag_configure("drop", background=ACCENT)
+element_tree.tag_configure("drop_bad", background="#8c2f2f")
 
 element_tree_sb = ttk.Scrollbar(element_tree_outer, orient="vertical", command=element_tree.yview)
 element_tree.configure(yscrollcommand=element_tree_sb.set)
@@ -1147,6 +1346,10 @@ if available_modules:
 
 # 事件绑定
 element_tree.bind("<<TreeviewSelect>>", on_tree_select)
+# 拖拽改层级
+element_tree.bind("<ButtonPress-1>", _on_tree_press)
+element_tree.bind("<B1-Motion>", _on_tree_drag)
+element_tree.bind("<ButtonRelease-1>", _on_tree_release)
 
 
 def _init_pane_ratios():
