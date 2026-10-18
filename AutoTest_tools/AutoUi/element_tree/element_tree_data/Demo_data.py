@@ -35,24 +35,6 @@ data = {
                 'container': {
                     'resourceId': 'com.android.settings:id/dashboard_container'
                 },
-                '5848adee814f46a4b8c389d8c796f411': {
-                    'name': '设备名称',
-                    'location_flag': 'location',
-                    'do_action': '',
-                    'location': {
-                        'resourceId': 'android:id/title',
-                        'text': '设备名称',
-                        'description': ''
-                    },
-                    'xpath': '//*[@text="设备名称"]',
-                    'image': {
-                        'image_path': 'element_tree/Images/settings/settings.jpg',
-                        'compare': 0.85
-                    },
-                    'container': {
-                        'resourceId': 'com.android.settings:id/content_frame'
-                    }
-                },
                 'df2ce4225e4a4d669211d1d9ef9eae19': {
                     'name': '法律信息',
                     'do_action': '',
@@ -65,6 +47,24 @@ data = {
                     'xpath': '//*[@text="法律信息"]',
                     'image': {
                         'image_path': 'element_tree/Images/settings/text.jpg',
+                        'compare': 0.85
+                    },
+                    'container': {
+                        'resourceId': 'com.android.settings:id/content_frame'
+                    }
+                },
+                '5848adee814f46a4b8c389d8c796f411': {
+                    'name': '设备名称',
+                    'location_flag': 'location',
+                    'do_action': '',
+                    'location': {
+                        'resourceId': 'android:id/title',
+                        'text': '设备名称',
+                        'description': ''
+                    },
+                    'xpath': '//*[@text="设备名称"]',
+                    'image': {
+                        'image_path': 'element_tree/Images/settings/settings.jpg',
                         'compare': 0.85
                     },
                     'container': {

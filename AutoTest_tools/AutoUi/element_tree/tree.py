@@ -368,7 +368,7 @@ def add_component():
         "location": {"resourceId": "", "text": "", "description": ""},
         "xpath": "//*[]",
         "image": {"image_path": "", "compare": 0.85},
-        "container": {"xpath": "//*[]"},
+        "container": {"elementID": ""},
     }
     val[new_id] = new_node
 
@@ -546,7 +546,7 @@ def add_component_ocr():
                 "location": {"resourceId": "", "text": name, "description": ""},
                 "xpath": xpath_attr,
                 "image": {"image_path": rel_path, "compare": 0.85},
-                "container": {"xpath": "//*[]"},
+                "container": {"elementID": ""},
             }
             pval[new_id] = new_node
             child_iid = element_tree.insert(parent_iid, "end", text=f"{name} ({new_id})")
@@ -579,7 +579,7 @@ def show_tree_menu(event):
 # ============ 左侧树拖拽改层级 ============
 
 # 拖拽状态
-_drag = {"item": None, "x": 0, "y": 0, "moving": False}
+_drag = {"item": None, "x": 0, "y": 0, "moving": False, "pos": "child"}
 _drag_ghost = None   # 拖拽时的悬浮跟随窗口
 
 
@@ -614,47 +614,89 @@ def _find_iid_by_key(key, parent=""):
     return None
 
 
-def _move_node(src_iid, target_iid):
-    """把 src_iid 节点移动到 target_iid（作为其子节点）；target_iid 为空则移到顶层。"""
+def _reinsert_key(d, key, val, anchor, after=True):
+    """把 (key, val) 插到 dict d 中 anchor 键之前/之后（原地重排顺序）。"""
+    new = {}
+    inserted = False
+    for k, v in d.items():
+        if k == anchor:
+            if not after:
+                new[key] = val
+            new[k] = v
+            if after:
+                new[key] = val
+            inserted = True
+        else:
+            new[k] = v
+    if not inserted:
+        new[key] = val
+    d.clear()
+    d.update(new)
+    return d
+
+
+def _move_node(src_iid, target_iid, position="child"):
+    """把 src_iid 节点移动到 target_iid 附近。
+
+    position:
+      "child" -> 作为 target 的子节点（target 为空则移到顶层）
+      "above" -> 作为 target 的前一个兄弟（调整同级/跨级顺序）
+      "below" -> 作为 target 的后一个兄弟
+    """
     if src_iid == target_iid:
         return
     if target_iid and _is_ancestor(src_iid, target_iid):
-        messagebox.showwarning("无法移动", "不能把节点移动到其自身或其子节点下", parent=root)
+        messagebox.showwarning("无法移动", "不能把节点移动到其自身或其子节点附近", parent=root)
         return
 
     skey, sval = node_data_map.get(src_iid, (None, None))
     if skey is None:
         return
 
-    # 先校验目标是否为可作父的容器（dict）
-    if target_iid:
-        tkey, tval = node_data_map.get(target_iid, (None, None))
-        if not isinstance(tval, dict):
-            messagebox.showwarning("无法移动", "目标节点不是容器，无法作为父节点", parent=root)
-            return
-
-    # 从源父字典中摘除
+    # 源所在字典
     src_parent = element_tree.parent(src_iid)
     if src_parent:
         _, spval = node_data_map.get(src_parent, (None, None))
-        if isinstance(spval, dict) and skey in spval:
-            del spval[skey]
-        else:
-            return
+        src_dict = spval if isinstance(spval, dict) else None
     else:
-        if skey in data:
-            del data[skey]
-        else:
-            return
+        src_dict = data
+    if not src_dict or skey not in src_dict:
+        return
+    del src_dict[skey]  # 先从原位置摘除
 
-    # 挂到目标下
-    if target_iid:
-        tkey, tval = node_data_map.get(target_iid, (None, None))
-        tval[skey] = sval
-        _log(f"拖拽移动: {skey}（{sval.get('name', skey)}）-> 挂到 {tkey}（{tval.get('name', tkey)}）下（未保存）")
-    else:
-        data[skey] = sval
-        _log(f"拖拽移动: {skey}（{sval.get('name', skey)}）-> 顶层（未保存）")
+    try:
+        if position == "child":
+            if not target_iid:
+                data[skey] = sval
+                _log(f"拖拽移动: {skey}（{sval.get('name', skey)}）-> 顶层（未保存）")
+            else:
+                tkey, tval = node_data_map.get(target_iid, (None, None))
+                if not isinstance(tval, dict):
+                    raise ValueError("目标节点不是容器，无法作为父节点")
+                tval[skey] = sval
+                _log(f"拖拽移动: {skey}（{sval.get('name', skey)}）-> 挂到 {tkey}"
+                     f"（{tval.get('name', tkey)}）下（未保存）")
+        else:
+            # above / below：插到 target 前/后，作为其兄弟
+            tkey, _ = node_data_map.get(target_iid, (None, None))
+            t_parent = element_tree.parent(target_iid)
+            if t_parent:
+                _, tpval = node_data_map.get(t_parent, (None, None))
+                t_dict = tpval if isinstance(tpval, dict) else None
+            else:
+                t_dict = data
+            if not t_dict or tkey not in t_dict:
+                raise ValueError("目标位置无效")
+            anchor_name = sval.get("name", skey)
+            tgt_val = node_data_map.get(target_iid, (None, {}))[1]
+            tgt_name = tgt_val.get("name", tkey) if isinstance(tgt_val, dict) else tkey
+            _reinsert_key(t_dict, skey, sval, tkey, after=(position == "below"))
+            _log(f"拖拽移动: {anchor_name} -> 插入到 {tgt_name} 的 "
+                 f"{'之后' if position == 'below' else '之前'}（未保存）")
+    except ValueError as e:
+        src_dict[skey] = sval  # 失败时还原到原位置
+        messagebox.showwarning("无法移动", str(e), parent=root)
+        return
 
     # 重建树并选中移动后的节点
     _rebuild_tree()
@@ -666,7 +708,7 @@ def _move_node(src_iid, target_iid):
         if parent_iid:
             element_tree.item(parent_iid, open=True)
     update_right_display(from_tree_click=True)
-    status_var.set("↕️ 已移动组件层级（未保存，点击「保存」落盘）")
+    status_var.set("↕️ 已调整组件顺序/层级（未保存，点击「保存」落盘）")
     _set_dirty(True)
 
 
@@ -686,18 +728,38 @@ def _clear_drop_tags():
             element_tree.item(it, tags=[t for t in tags if t not in ("drop", "drop_bad")])
 
 
-def _is_drop_valid(target_iid, src_iid):
-    """判断 target 能否作为 src 的新父。返回 (是否可放, 落点描述)。"""
+def _get_position(target_iid, event_y):
+    """根据鼠标在目标行内的纵向位置判断放置方式。
+    上 30% -> above（成为前兄弟）；下 30% -> below（成为后兄弟）；中间 -> child（作为子节点）。"""
+    if not target_iid:
+        return "child"
+    bbox = element_tree.bbox(target_iid)
+    if not bbox:
+        return "child"
+    _, ty, _, th = bbox
+    rel = event_y - ty
+    if rel < th * 0.3:
+        return "above"
+    if rel > th * 0.7:
+        return "below"
+    return "child"
+
+
+def _is_drop_valid(target_iid, src_iid, position="child"):
+    """判断 target 附近能否放置 src。返回 (是否可放, 落点描述)。"""
     if not target_iid:
         return True, "顶层"
     if target_iid == src_iid:
         return False, "不能拖到自身"
     if _is_ancestor(src_iid, target_iid):
-        return False, "不能拖到自己的子节点"
+        return False, "不能拖到自己的子节点附近"
     tkey, tval = node_data_map.get(target_iid, (None, None))
-    if not isinstance(tval, dict):
-        return False, "目标不是容器"
-    return True, f"{tval.get('name', tkey)} 下"
+    tname = tval.get("name", tkey) if isinstance(tval, dict) else tkey
+    if position == "child":
+        if not isinstance(tval, dict):
+            return False, "目标不是容器"
+        return True, f"{tname} 下"
+    return True, f"{tname} 的{'之前' if position == 'above' else '之后'}"
 
 
 def _update_ghost(event, src_text):
@@ -716,11 +778,13 @@ def _update_ghost(event, src_text):
 
 
 def _update_drop_preview(event):
-    """位置预知：根据鼠标所在行判定落点，高亮目标并更新悬浮窗文字。"""
+    """位置预知：根据鼠标在行内的位置判定落点，高亮目标并更新悬浮窗文字。"""
     if _drag_ghost is None:
         return
     target = element_tree.identify_row(event.y)
-    ok, reason = _is_drop_valid(target, _drag["item"])
+    pos = _get_position(target, event.y)
+    _drag["pos"] = pos
+    ok, reason = _is_drop_valid(target, _drag["item"], pos)
     _clear_drop_tags()
     if ok and target:
         element_tree.item(target, tags=("drop",))
@@ -768,7 +832,8 @@ def _on_tree_release(event):
     if not src or not was_moving:
         return
     target = element_tree.identify_row(event.y)
-    _move_node(src, target)
+    pos = _get_position(target, event.y)
+    _move_node(src, target, pos)
 
 
 # ============ 图片预览 / Android 截图 / 框选 ============
