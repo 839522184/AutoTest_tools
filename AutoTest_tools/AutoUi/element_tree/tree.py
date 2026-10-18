@@ -36,6 +36,8 @@ _do_action_methods = {}
 _do_action_files = {}
 # do_action 编辑框的「已保存」内容快照（用于判断是否有未保存修改）
 _saved_code_snapshot = ""
+# 编辑框当前是否处于「该节点没有关联的 Python 代码」占位提示状态（未输入新代码时，保存不应创建方法）
+_placeholder_active = False
 
 
 def _log(msg):
@@ -77,10 +79,11 @@ ADB_EXEC = "adb"               # adb 可执行文件（已在 PATH 或填完整�
 DO_ACTION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "do_action")
 # ------------------------ ** **
 
-# 运行时状态：当前加载的元素树字典、模块对象、字典变量名
+# 运行时状态：当前加载的元素树字典、模块对象、字典变量名、当前项目名
 data = {}
 current_mod = None
 current_dict_name = "data"
+current_project = ""   # 当前项目名 = 元素树模块名（如 xiaomi_11），用于定位同名的 do_action / 图片子目录
 
 
 def insert_node(tree_widget, parent, key, value):
@@ -173,7 +176,8 @@ def _find_tree_dict(mod):
 
 def load_data_module(mod_name):
     """动态加载指定元素树模块，重建左侧树并清空右侧面板。"""
-    global data, current_mod, current_dict_name
+    global data, current_mod, current_dict_name, current_project
+    current_project = mod_name
     _scan_do_action_methods()
     try:
         import importlib
@@ -219,7 +223,7 @@ def on_combo_select(event):
 
 def update_right_display(from_tree_click=False):
     """核心联动：刷新右侧 Excel 属性表与下方代码框"""
-    global _saved_code_snapshot
+    global _saved_code_snapshot, _placeholder_active
     selected_items = element_tree.selection()
     if not selected_items:
         return
@@ -266,10 +270,13 @@ def update_right_display(from_tree_click=False):
             code_box.insert(tk.END, body)
             if body and not body.endswith("\n"):
                 code_box.insert(tk.END, "\n")
+            _placeholder_active = False
         else:
             code_box.insert(tk.END, "该节点没有关联的 Python 代码")
+            _placeholder_active = True   # 占位提示，保存时不应创建方法
     else:
         code_box.insert(tk.END, "# 该节点没有关联的 Python 代码")
+        _placeholder_active = True
     # 记录快照：展示视为已保存状态，用户后续改动才触发未保存高亮
     _saved_code_snapshot = code_box.get("1.0", tk.END)
 
@@ -556,10 +563,11 @@ def add_component_ocr():
                 right, bot = int(max(x0, x2) / scale), int(max(y0, y2) / scale)
             else:
                 left, top, right, bot = 0, 0, img.width, img.height
-            os.makedirs(IMAGE_DIR, exist_ok=True)
+            abs_dir, rel_prefix = _current_image_dir()
+            os.makedirs(abs_dir, exist_ok=True)
             fname = f"{_safe_filename(name)}_{datetime.datetime.now().strftime('%H%M%S')}.png"
-            img.crop((left, top, right, bot)).save(os.path.join(IMAGE_DIR, fname), "PNG")
-            rel_path = f"{IMAGE_REL_PREFIX}/{fname}"
+            img.crop((left, top, right, bot)).save(os.path.join(abs_dir, fname), "PNG")
+            rel_path = f"{rel_prefix}/{fname}"
 
             # 2) 组装新组件：识别结果同时作为 name / location.text / xpath
             xpath_attr = f'//*[@text="{name.replace(chr(34), chr(39))}"]'
@@ -877,6 +885,14 @@ def _resolve_image_path(path):
     return abs_p if os.path.exists(abs_p) else None
 
 
+def _current_image_dir():
+    """返回当前项目对应的图片绝对目录与相对路径前缀（Images/<项目名>/）。"""
+    proj = current_project or "default"
+    abs_dir = os.path.join(IMAGE_DIR, proj)
+    rel_prefix = f"{IMAGE_REL_PREFIX}/{proj}"
+    return abs_dir, rel_prefix
+
+
 def take_android_screenshot(dest_path):
     """用 adb 从 Android 设备截屏保存到 dest_path。返回 (ok, msg)。"""
     try:
@@ -980,17 +996,12 @@ def _safe_filename(name):
 
 
 def _refresh_image_preview(is_dict, mode):
-    """按当前选中节点刷新「缩略图展示区」：image 定位方式下展示缩略图 + 框选按钮。"""
+    """按当前选中节点刷新「缩略图展示区」：所有定位方式下都展示缩略图 + 框选按钮。"""
     global _preview_photo
     for w in image_preview_body.winfo_children():
         w.destroy()
 
-    # 仅 image 定位方式下展示
-    if not (is_dict and mode == "image"):
-        ttk.Label(image_preview_body, text="📷 仅 image 定位方式下展示缩略图",
-                  foreground=FG_DIM).pack(anchor="w")
-        return
-
+    # 所有定位方式都展示缩略图区
     sel = element_tree.selection()
     if not sel:
         ttk.Label(image_preview_body, text="请在左侧选择一个组件节点",
@@ -1100,12 +1111,13 @@ def box_select_image(key, val):
             messagebox.showwarning("区域过小", "框选区域过小，请重新框选", parent=win)
             return
         crop = img.crop((left, top, right, bot))
-        os.makedirs(IMAGE_DIR, exist_ok=True)
+        abs_dir, rel_prefix = _current_image_dir()
+        os.makedirs(abs_dir, exist_ok=True)
         name_src = val.get("name") if isinstance(val, dict) else key
         fname = f"{_safe_filename(name_src)}_{datetime.datetime.now().strftime('%H%M%S')}.png"
-        save_path = os.path.join(IMAGE_DIR, fname)
+        save_path = os.path.join(abs_dir, fname)
         crop.save(save_path, "PNG")
-        rel_path = f"{IMAGE_REL_PREFIX}/{fname}"
+        rel_path = f"{rel_prefix}/{fname}"
         if isinstance(val, dict):
             val.setdefault("image", {})["image_path"] = rel_path
         status_var.set(f"🖼️ 已保存裁剪图片: {rel_path}（未保存，点击「保存」落盘）")
@@ -1120,30 +1132,32 @@ def box_select_image(key, val):
 # ============ do_action 方法检索 / 编辑保存 ============
 
 def _scan_do_action_methods():
-    """扫描 DO_ACTION_DIR 下所有 .py，建立 {方法名: 源码} 与 {方法名: 文件路径} 映射。"""
+    """仅扫描当前项目对应的 do_action 文件（<项目名>.py），
+    建立 {方法名: 源码} 与 {方法名: 文件路径} 映射。"""
     global _do_action_methods, _do_action_files
     _do_action_methods = {}
     _do_action_files = {}
-    if not os.path.isdir(DO_ACTION_DIR):
+    proj = current_project
+    if not proj or not os.path.isdir(DO_ACTION_DIR):
         return
-    for fname in os.listdir(DO_ACTION_DIR):
-        if not fname.endswith(".py"):
-            continue
-        fpath = os.path.join(DO_ACTION_DIR, fname)
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                src = f.read()
-            tree = ast.parse(src)
-            lines = src.splitlines()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef):
-                    code = "\n".join(lines[node.lineno - 1:node.end_lineno])
-                    _do_action_methods[node.name] = code
-                    _do_action_files[node.name] = fpath
-        except Exception:
-            continue
+    fpath = os.path.join(DO_ACTION_DIR, proj + ".py")
+    if not os.path.exists(fpath):
+        _log(f"do_action 扫描: 当前项目 {proj} 无对应方法文件 {proj}.py")
+        return
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            src = f.read()
+        tree = ast.parse(src)
+        lines = src.splitlines()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                code = "\n".join(lines[node.lineno - 1:node.end_lineno])
+                _do_action_methods[node.name] = code
+                _do_action_files[node.name] = fpath
+    except Exception:
+        return
     if _do_action_methods:
-        _log(f"do_action 方法扫描: 共 {len(_do_action_methods)} 个"
+        _log(f"do_action 方法扫描: 项目 {proj} 共 {len(_do_action_methods)} 个"
              f" -> {', '.join(list(_do_action_methods)[:10])}")
 
 
@@ -1178,13 +1192,11 @@ def _wrap_func(name, body):
 
 
 def _get_default_action_file():
-    """获取保存 do_action 的目标文件：优先 DO_ACTION_DIR 下已有 .py，否则新建 do_action.py。"""
+    """获取保存 do_action 的目标文件：当前项目对应的 <项目名>.py（不存在则返回待创建路径）。"""
     if not os.path.isdir(DO_ACTION_DIR):
         os.makedirs(DO_ACTION_DIR, exist_ok=True)
-    for fname in sorted(os.listdir(DO_ACTION_DIR)):
-        if fname.endswith(".py"):
-            return os.path.join(DO_ACTION_DIR, fname)
-    return os.path.join(DO_ACTION_DIR, "do_action.py")
+    proj = current_project or "do_action"
+    return os.path.join(DO_ACTION_DIR, proj + ".py")
 
 
 def _parse_funcs(code):
@@ -1290,6 +1302,11 @@ def _save_do_action_code(_ev=None, silent=False):
         return (True if silent else "break")
     method_key = str(key)
 
+    # 当前编辑框为「该节点没有关联的 Python 代码」占位提示状态（节点无方法且未输入新代码）：
+    # 点击保存不应创建方法，直接跳过（silent 返回 False，避免误报“do_action 已保存”）
+    if _placeholder_active:
+        return (False if silent else "break")
+
     content = code_box.get("1.0", tk.END).rstrip("\n")
 
     # 编辑框被清空 -> 删除当前组件对应的方法，并把 do_action 字段置空
@@ -1332,6 +1349,22 @@ def _insert_code_tab(_ev=None):
     """编辑 do_action 代码时按 Tab 插入 4 个空格，保证与代码缩进一致。"""
     code_box.insert(tk.INSERT, "    ")
     return "break"
+
+
+def _on_code_key(ev=None):
+    """用户开始输入时，清空「该节点没有关联的 Python 代码」占位提示，使其转为真实编辑。
+    导航/修饰键（方向键、Shift、Ctrl 等）不触发清空，保留文字供浏览。"""
+    global _placeholder_active
+    if not _placeholder_active:
+        return None
+    if ev is not None:
+        nav = {"Shift", "Control", "Alt", "Escape", "Up", "Down", "Left", "Right",
+               "Home", "End", "Prior", "Next", "Caps_Lock", "Return", "Tab"}
+        if ev.keysym in nav:
+            return None
+    code_box.delete("1.0", tk.END)
+    _placeholder_active = False
+    return None
 
 
 def _on_code_edit(_ev=None):
@@ -1645,6 +1678,7 @@ code_box.pack(fill="both", expand=True)
 # Ctrl+S 保存当前节点的 do_action 代码块；Tab 插入 4 空格缩进；编辑联动保存按钮高亮
 code_box.bind("<Control-s>", _save_do_action_code)
 code_box.bind("<Tab>", _insert_code_tab)
+code_box.bind("<Key>", _on_code_key)          # 开始输入时清空「无关联代码」占位提示
 code_box.bind("<KeyRelease>", _on_code_edit)
 
 # 底部状态栏
